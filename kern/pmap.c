@@ -102,7 +102,12 @@ boot_alloc(uint32_t n)
 	// to a multiple of PGSIZE.
 	//
 	// LAB 2: Your code here.
-
+	if (n == 0) return nextfree;
+	else if (n > 0) {
+		result = nextfree;
+		nextfree += ROUNDUP(n, PGSIZE);
+		return result;
+	}
 	return NULL;
 }
 
@@ -125,7 +130,7 @@ mem_init(void)
 	i386_detect_memory();
 
 	// Remove this line when you're ready to test this function.
-	panic("mem_init: This function is not finished\n");
+	// panic("mem_init: This function is not finished\n");
 
 	//////////////////////////////////////////////////////////////////////
 	// create initial page directory.
@@ -148,7 +153,8 @@ mem_init(void)
 	// array.  'npages' is the number of physical pages in memory.  Use memset
 	// to initialize all fields of each struct PageInfo to 0.
 	// Your code goes here:
-
+	pages = (struct PageInfo*)boot_alloc(npages * sizeof(struct PageInfo));
+	memset(pages, 0, npages * sizeof(struct PageInfo));
 
 	//////////////////////////////////////////////////////////////////////
 	// Now that we've allocated the initial kernel data structures, we set
@@ -172,6 +178,7 @@ mem_init(void)
 	//      (ie. perm = PTE_U | PTE_P)
 	//    - pages itself -- kernel RW, user NONE
 	// Your code goes here:
+	boot_map_region(kern_pgdir, (uintptr_t)UPAGES, npages*sizeof(struct PageInfo), PADDR(pages), PTE_U | PTE_P);
 
 	//////////////////////////////////////////////////////////////////////
 	// Use the physical memory that 'bootstack' refers to as the kernel
@@ -184,6 +191,7 @@ mem_init(void)
 	//       overwrite memory.  Known as a "guard page".
 	//     Permissions: kernel RW, user NONE
 	// Your code goes here:
+	boot_map_region(kern_pgdir, (uintptr_t) (KSTACKTOP-KSTKSIZE), KSTKSIZE, PADDR(bootstack), PTE_W | PTE_P);
 
 	//////////////////////////////////////////////////////////////////////
 	// Map all of physical memory at KERNBASE.
@@ -193,6 +201,7 @@ mem_init(void)
 	// we just set up the mapping anyway.
 	// Permissions: kernel RW, user NONE
 	// Your code goes here:
+	boot_map_region(kern_pgdir, (uintptr_t) KERNBASE, ROUNDUP(0xffffffff - KERNBASE, PGSIZE), 0, PTE_W | PTE_P);
 
 	// Check that the initial page directory has been set up correctly.
 	check_kern_pgdir();
@@ -235,28 +244,40 @@ void
 page_init(void)
 {
 	// The example code here marks all physical pages as free.
-	// However this is not truly the case.  What memory is free?
-	//  1) Mark physical page 0 as in use.
-	//     This way we preserve the real-mode IDT and BIOS structures
-	//     in case we ever need them.  (Currently we don't, but...)
-	//  2) The rest of base memory, [PGSIZE, npages_basemem * PGSIZE)
-	//     is free.
-	//  3) Then comes the IO hole [IOPHYSMEM, EXTPHYSMEM), which must
-	//     never be allocated.
-	//  4) Then extended memory [EXTPHYSMEM, ...).
-	//     Some of it is in use, some is free. Where is the kernel
-	//     in physical memory?  Which pages are already in use for
-	//     page tables and other data structures?
-	//
-	// Change the code to reflect this.
-	// NB: DO NOT actually touch the physical memory corresponding to
-	// free pages!
 	size_t i;
-	for (i = 0; i < npages; i++) {
-		pages[i].pp_ref = 0;
-		pages[i].pp_link = page_free_list;
-		page_free_list = &pages[i];
-	}
+
+    //  1) Mark physical page 0 as in use.
+    //     This way we preserve the real-mode IDT and BIOS structures
+    //     in case we ever need them.  (Currently we don't, but...)
+    pages[0].pp_ref = 1;
+
+    //  2) The rest of base memory, [PGSIZE, npages_basemem * PGSIZE)
+    //     is free.
+    for (i = 1; i < npages_basemem; i++) {
+        pages[i].pp_ref = 0;
+        pages[i].pp_link = page_free_list;
+        page_free_list = &pages[i];
+    }
+
+    //  3) Then comes the IO hole [IOPHYSMEM, EXTPHYSMEM), which must
+    //     never be allocated.
+    for (i = IOPHYSMEM/PGSIZE; i < EXTPHYSMEM/PGSIZE; i++) {
+        pages[i].pp_ref = 1;
+    }
+
+    //  4) Then extended memory [EXTPHYSMEM, ...).
+    //     Some of it is in use, some is free. Where is the kernel
+    //     in physical memory?  Which pages are already in use for
+    //     page tables and other data structures?
+    size_t first_free_address = PADDR(boot_alloc(0));
+    for (i = EXTPHYSMEM/PGSIZE; i < first_free_address/PGSIZE; i++) {
+        pages[i].pp_ref = 1;
+    }
+    for (i = first_free_address/PGSIZE; i < npages; i++) {
+        pages[i].pp_ref = 0;
+        pages[i].pp_link = page_free_list;
+        page_free_list = &pages[i];
+    }
 }
 
 //
@@ -275,7 +296,16 @@ struct PageInfo *
 page_alloc(int alloc_flags)
 {
 	// Fill this function in
-	return 0;
+    if (page_free_list == NULL) {
+        return NULL;
+    }
+    struct PageInfo *allocated_page = page_free_list;
+    page_free_list = page_free_list->pp_link;
+    allocated_page->pp_link = NULL; 
+    if (alloc_flags & ALLOC_ZERO) {
+        memset(page2kva(allocated_page), '\0', PGSIZE);
+    }
+    return allocated_page;
 }
 
 //
@@ -288,6 +318,12 @@ page_free(struct PageInfo *pp)
 	// Fill this function in
 	// Hint: You may want to panic if pp->pp_ref is nonzero or
 	// pp->pp_link is not NULL.
+    if (pp->pp_ref > 0 || pp->pp_link != NULL) {
+        panic("Double check failed when dealloc page");
+        return;
+    }
+    pp->pp_link = page_free_list;
+    page_free_list = pp;
 }
 
 //
@@ -327,7 +363,27 @@ pte_t *
 pgdir_walk(pde_t *pgdir, const void *va, int create)
 {
 	// Fill this function in
-	return NULL;
+	// 参数1: 页目录项指针
+    // 参数2: 线性地址，JOS 中等于虚拟地址
+    // 参数3: 若页目录项不存在是否创建
+    // 返回: 页表项指针
+	uint32_t page_dir_idx = PDX(va);
+    uint32_t page_tab_idx = PTX(va);
+	pte_t *pgtbl;
+	if (pgdir[page_dir_idx] & PTE_P) pgtbl = KADDR(PTE_ADDR(pgdir[page_dir_idx]));
+	else{
+		// 调一个新页存储目录项
+		if (create){
+			struct PageInfo *new_page = page_alloc(ALLOC_ZERO);
+			if (new_page){
+				new_page->pp_ref += 1;
+				pgtbl = (pte_t*)page2kva(new_page);
+				// 修改页目录的flag
+				pgdir[page_dir_idx] = PADDR(pgtbl) | PTE_P | PTE_W | PTE_U;
+			} else {return NULL;}
+		} else {return NULL;}
+	}
+	return (pte_t*) &pgtbl[page_tab_idx];
 }
 
 //
@@ -345,6 +401,29 @@ static void
 boot_map_region(pde_t *pgdir, uintptr_t va, size_t size, physaddr_t pa, int perm)
 {
 	// Fill this function in
+	pte_t *pgtab;
+    size_t pg_num = PGNUM(size);
+    // cprintf("map region size = %d, %d pages\n",size, pg_num);
+    for (size_t i = 0; i < pg_num; i++) {
+        pgtab = pgdir_walk(pgdir, (void *)va, 1);
+        if (!pgtab) return;
+        *pgtab = pa | perm | PTE_P;
+        va += PGSIZE;
+        pa += PGSIZE;
+    }
+
+	// // 发生溢出（size进行roundup后end_addr被截断）
+	// pte_t *pgtbl;
+	// size_t end_addr = va + size;
+	// cprintf("size = %d ",size);
+	// cprintf("pgnum = %d\n",PGNUM(size));
+	// cprintf("end_addr = %x\n",end_addr);
+	// for (; va < end_addr; va += PGSIZE, pa += PGSIZE){
+	// 	pgtbl = pgdir_walk(pgdir, (void*)va, 1);
+	// 	if (!pgtbl) return;
+	// 	*pgtbl = pa | perm | PTE_P;
+	// 	cprintf("va = %x\n",(uint64_t)va);
+	// }
 }
 
 //
@@ -376,6 +455,17 @@ int
 page_insert(pde_t *pgdir, struct PageInfo *pp, void *va, int perm)
 {
 	// Fill this function in
+	pte_t *pgtab = pgdir_walk(pgdir, va, 1);
+    if (!pgtab) {
+        return -E_NO_MEM;
+    }
+
+    // 提前增加引用;判断虚拟页是否之前已经被映射过 
+    pp->pp_ref++;
+    if (*pgtab & PTE_P) {
+        page_remove(pgdir, va);
+    }
+    *pgtab = page2pa(pp) | perm | PTE_P;
 	return 0;
 }
 
@@ -394,7 +484,10 @@ struct PageInfo *
 page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
 {
 	// Fill this function in
-	return NULL;
+	pte_t *pgtbl = pgdir_walk(pgdir, va, 0);
+	if (!pgtbl) return NULL;
+	if (pte_store) *pte_store = pgtbl;
+	return pa2page(PTE_ADDR(*pgtbl));
 }
 
 //
@@ -416,6 +509,13 @@ void
 page_remove(pde_t *pgdir, void *va)
 {
 	// Fill this function in
+	pte_t *pgtbl;
+	pte_t **pte_store = &pgtbl;
+	struct PageInfo *tpg = page_lookup(pgdir, va, pte_store);
+	if (!tpg) return;
+	page_decref(tpg);
+	*(*pte_store) = 0;
+	tlb_invalidate(pgdir, va);
 }
 
 //
@@ -429,6 +529,7 @@ tlb_invalidate(pde_t *pgdir, void *va)
 	// For now, there is only one address space, so always invalidate.
 	invlpg(va);
 }
+
 
 
 // --------------------------------------------------------------

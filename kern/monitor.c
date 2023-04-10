@@ -10,6 +10,7 @@
 #include <kern/console.h>
 #include <kern/monitor.h>
 #include <kern/kdebug.h>
+#include <kern/pmap.h>
 
 #define CMDBUF_SIZE	80	// enough for one VGA text line
 
@@ -25,6 +26,7 @@ static struct Command commands[] = {
 	{ "help", "Display this list of commands", mon_help },
 	{ "kerninfo", "Display information about the kernel", mon_kerninfo },
 	{ "backtrace", "Display backtrace information", mon_backtrace },
+	{ "showpages", "Display pages mapped situation between addr1 and addr2", map_showpages },
 };
 
 /***** Implementations of basic kernel monitor commands *****/
@@ -52,6 +54,51 @@ mon_kerninfo(int argc, char **argv, struct Trapframe *tf)
 	cprintf("  end    %08x (virt)  %08x (phys)\n", end, end - KERNBASE);
 	cprintf("Kernel executable memory footprint: %dKB\n",
 		ROUNDUP(end - entry, 1024) / 1024);
+	return 0;
+}
+
+int map_showpages(int argc, char **argv, struct Trapframe *tf) {
+	// 参数检查
+	// strat_addr、end_addr 查看起始地址和终止地址之间的页map情况
+    if (argc != 3) {
+        cprintf("Requir 2 virtual address as arguments.\n");
+        return -1;
+    }
+
+    char *errChar;
+    uintptr_t start_addr = strtol(argv[1], &errChar, 16);
+    if (*errChar) {
+        cprintf("Invalid virtual address: %s.\n", argv[1]);
+        return -1;
+    }
+
+    uintptr_t end_addr = strtol(argv[2], &errChar, 16);
+    if (*errChar) {
+        cprintf("Invalid virtual address: %s.\n", argv[2]);
+        return -1;
+    }
+    if (start_addr > end_addr) {
+        cprintf("Address 1 must be lower than address 2\n");
+        return -1;
+    }
+	
+	// 按页对齐
+    start_addr = ROUNDDOWN(start_addr, PGSIZE);
+    end_addr = ROUNDUP(end_addr, PGSIZE);
+	uintptr_t cur_addr = start_addr;
+	while (cur_addr <= end_addr){
+		pte_t *cur_pte = pgdir_walk(kern_pgdir, (void*)cur_addr, 0);
+		if (!cur_pte || !(*cur_pte & PTE_P)) cprintf("Virtual address [%08x] - not mapped\n", cur_addr);
+		else {
+			cprintf( "Virtual address [%08x] - physical address [%08x], permission: ", cur_addr, PTE_ADDR(*cur_pte));
+            char perm_PS = (*cur_pte & PTE_PS) ? 'S':'-';
+            char perm_W = (*cur_pte & PTE_W) ? 'W':'-';
+            char perm_U = (*cur_pte & PTE_U) ? 'U':'-';
+            // 进入 else 分支说明 PTE_P 肯定为真了
+            cprintf( "-%c----%c%cP\n", perm_PS, perm_U, perm_W);
+		}
+		cur_addr += PGSIZE;
+	}
 	return 0;
 }
 
