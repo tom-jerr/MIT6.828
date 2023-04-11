@@ -11,6 +11,7 @@
 #include <kern/monitor.h>
 #include <kern/kdebug.h>
 #include <kern/trap.h>
+#include <kern/pmap.h>
 
 #define CMDBUF_SIZE	80	// enough for one VGA text line
 
@@ -25,6 +26,10 @@ struct Command {
 static struct Command commands[] = {
 	{ "help", "Display this list of commands", mon_help },
 	{ "kerninfo", "Display information about the kernel", mon_kerninfo },
+	{ "backtrace", "Display backtrace information", mon_backtrace },
+	{ "showpages", "Display pages mapped situation between addr1 and addr2", map_showpages },
+	{ "step", "Step the program", mon_step },
+	{ "continue", "Continue the program", mon_continue },
 };
 
 /***** Implementations of basic kernel monitor commands *****/
@@ -55,13 +60,99 @@ mon_kerninfo(int argc, char **argv, struct Trapframe *tf)
 	return 0;
 }
 
+int map_showpages(int argc, char **argv, struct Trapframe *tf) {
+	// 参数检查
+	// strat_addr、end_addr 查看起始地址和终止地址之间的页map情况
+    if (argc != 3) {
+        cprintf("Requir 2 virtual address as arguments.\n");
+        return -1;
+    }
+
+    char *errChar;
+    uintptr_t start_addr = strtol(argv[1], &errChar, 16);
+    if (*errChar) {
+        cprintf("Invalid virtual address: %s.\n", argv[1]);
+        return -1;
+    }
+
+    uintptr_t end_addr = strtol(argv[2], &errChar, 16);
+    if (*errChar) {
+        cprintf("Invalid virtual address: %s.\n", argv[2]);
+        return -1;
+    }
+    if (start_addr > end_addr) {
+        cprintf("Address 1 must be lower than address 2\n");
+        return -1;
+    }
+	
+	// 按页对齐
+    start_addr = ROUNDDOWN(start_addr, PGSIZE);
+    end_addr = ROUNDUP(end_addr, PGSIZE);
+	uintptr_t cur_addr = start_addr;
+	while (cur_addr <= end_addr){
+		pte_t *cur_pte = pgdir_walk(kern_pgdir, (void*)cur_addr, 0);
+		if (!cur_pte || !(*cur_pte & PTE_P)) cprintf("Virtual address [%08x] - not mapped\n", cur_addr);
+		else {
+			cprintf( "Virtual address [%08x] - physical address [%08x], permission: ", cur_addr, PTE_ADDR(*cur_pte));
+            char perm_PS = (*cur_pte & PTE_PS) ? 'S':'-';
+            char perm_W = (*cur_pte & PTE_W) ? 'W':'-';
+            char perm_U = (*cur_pte & PTE_U) ? 'U':'-';
+            // 进入 else 分支说明 PTE_P 肯定为真了
+            cprintf( "-%c----%c%cP\n", perm_PS, perm_U, perm_W);
+		}
+		cur_addr += PGSIZE;
+	}
+	return 0;
+}
+
 int
 mon_backtrace(int argc, char **argv, struct Trapframe *tf)
 {
 	// Your code here.
+	// ebp指针指向的地址中存着的是父函数的ebp指针
+    uint32_t ebp, eip, arg;
+    struct Eipdebuginfo info;
+
+    cprintf("Stack backtrace:\n");
+
+	// backtrace the ebp chain
+    for(ebp = read_ebp(); ebp != 0; ebp = *(uint32_t*)(ebp)) {
+        cprintf("  ebp %08x", ebp);
+        eip = *((uint32_t*)ebp + 1);
+        cprintf("  eip %08x", eip);
+        cprintf("  args");
+        for(int i = 0; i < 5; ++i) {
+            arg = *((uint32_t*)ebp + 2 + i);
+            cprintf(" %08x", arg);
+        }
+        cprintf("\n");
+
+		// get eip info
+        debuginfo_eip(eip, &info);
+        cprintf("         %s:%d: %.*s+%u\n", 
+            info.eip_file, 
+            info.eip_line, 
+            info.eip_fn_namelen, info.eip_fn_name, 
+            eip - info.eip_fn_addr);
+    }
 	return 0;
 }
 
+int mon_continue(int argc, char **argv, struct Trapframe *tf) {
+    if (!(tf && (tf->tf_trapno == T_DEBUG || tf->tf_trapno == T_BRKPT) && 
+          ((tf->tf_cs & 3) == 3)))
+        return 0;
+    tf->tf_eflags &= ~FL_TF;
+    return -1;
+}
+
+int mon_step(int argc, char **argv, struct Trapframe *tf) {
+    if (!(tf && (tf->tf_trapno == T_DEBUG || tf->tf_trapno == T_BRKPT) && 
+          ((tf->tf_cs & 3) == 3)))
+        return 0;
+    tf->tf_eflags |= FL_TF;
+    return -1;
+}
 
 
 /***** Kernel monitor command interpreter *****/
@@ -118,6 +209,7 @@ monitor(struct Trapframe *tf)
 
 	if (tf != NULL)
 		print_trapframe(tf);
+	cprintf("6828 decimal is %o octal!\n", 6828);
 
 	while (1) {
 		buf = readline("K> ");
